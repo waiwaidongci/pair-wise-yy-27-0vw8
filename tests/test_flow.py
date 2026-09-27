@@ -7,9 +7,11 @@ class CollationFlowTest(unittest.TestCase):
     def setUp(self):
         fd,self.path=tempfile.mkstemp(suffix=".db"); os.close(fd); self.db=CollationDB(self.path)
         self.owner=self.db.add_user("负责人","owner"); self.editor=self.db.add_user("编辑","editor"); self.reviewer=self.db.add_user("审阅","reviewer"); self.outsider=self.db.add_user("外部","reviewer")
+        self.viewer=self.db.add_user("访客","reviewer")
         self.work=self.db.create_work("残卷","异文比较",self.owner)
         self.w1=self.db.add_witness(self.work,"甲本","version"); self.w2=self.db.add_witness(self.work,"乙本","fragment","馆藏残片","中段缺页")
-        self.db.grant_witness_editor(self.w2,self.editor,self.owner); self.db.grant_work_access(self.work,self.reviewer,"view",self.owner)
+        self.db.grant_witness_editor(self.w2,self.editor,self.owner); self.db.grant_work_access(self.work,self.reviewer,"review",self.owner)
+        self.db.grant_work_access(self.work,self.viewer,"view",self.owner)
         self.passage=self.db.add_passage(self.work,"第一节","春水东流，故人南去。",self.owner)
         self.db.align_passage(self.passage,self.w1,"春水东流，故人南去。",1,self.owner)
         self.db.align_passage(self.passage,self.w2,"春水东流，[缺页]",2,self.editor)
@@ -23,6 +25,7 @@ class CollationFlowTest(unittest.TestCase):
         exported=self.db.export_collation(self.work,self.reviewer)
         self.assertEqual(1,exported["gap_count"])
         self.assertTrue(exported["passages"][0]["variants"][0]["notes"] == [])
+        self.db.add_review(variant,"adopt","残笔可据，可以采用",self.reviewer)
         self.db.lock_passage(self.passage,self.owner,"定稿")
         with self.assertRaisesRegex(DomainError,"锁定"):
             self.db.update_variant(variant,"另一文本","无意义修改",self.editor,2)
@@ -36,5 +39,47 @@ class CollationFlowTest(unittest.TestCase):
             self.db.export_collation(self.work,self.outsider)
         with self.assertRaisesRegex(DomainError,"括号"):
             self.db.align_passage(self.passage,self.w1,"文本[未闭合",9,self.owner)
+    def test_review_flow_invalidation_lock_and_export(self):
+        variant_a=self.db.create_variant(self.passage,self.w2,"补足一","理由一",self.editor,0)
+        variant_b=self.db.create_variant(self.passage,self.w2,"补足二","理由二",self.editor,1)
+        with self.assertRaisesRegex(DomainError,"无权审阅"):
+            self.db.add_review(variant_a,"adopt","可以",self.viewer)
+        with self.assertRaisesRegex(DomainError,"无权审阅"):
+            self.db.add_review(variant_a,"adopt","可以",self.outsider)
+        with self.assertRaisesRegex(DomainError,"adopt"):
+            self.db.add_review(variant_a,"maybe","可以",self.reviewer)
+        with self.assertRaisesRegex(DomainError,"意见"):
+            self.db.add_review(variant_a,"adopt","  ",self.reviewer)
+        with self.assertRaisesRegex(DomainError,"2 条异文未决"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        review=self.db.add_review(variant_a,"adopt","补字可信",self.reviewer)
+        self.assertEqual(1,review["layer"])
+        self.db.add_review(variant_a,"reject","改判：证据不足",self.reviewer)
+        exported=self.db.export_collation(self.work,self.reviewer)
+        va=exported["passages"][0]["variants"][0]
+        self.assertEqual("rejected",va["review_status"])
+        self.assertEqual("改判：证据不足",va["review"]["comment"])
+        self.assertEqual("审阅",va["review"]["reviewer_name"])
+        with self.assertRaisesRegex(DomainError,"1 条异文未决"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        self.db.add_review(variant_b,"reject","拟文无版本依据",self.reviewer)
+        self.db.update_variant(variant_a,"春水东流，[不可辨]人南去。","墨迹受损，改从残笔",self.editor,2)
+        exported=self.db.export_collation(self.work,self.owner)
+        by_id={v["id"]:v for v in exported["passages"][0]["variants"]}
+        va,vb=by_id[variant_a],by_id[variant_b]
+        self.assertEqual("pending",va["review_status"])
+        self.assertIsNone(va["review"])
+        self.assertEqual(1,len(va["review_history"]))
+        self.assertEqual(1,va["review_history"][0]["superseded"])
+        self.assertEqual("rejected",vb["review_status"])
+        self.assertEqual({"adopted":0,"rejected":1,"pending":1},exported["review_summary"])
+        with self.assertRaisesRegex(DomainError,"1 条异文未决"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        self.db.add_review(variant_a,"adopt","改从残笔，可以采用",self.reviewer)
+        self.db.lock_passage(self.passage,self.owner,"定稿")
+        exported=self.db.export_collation(self.work,self.owner)
+        self.assertEqual({"adopted":1,"rejected":1,"pending":0},exported["review_summary"])
+        with self.assertRaisesRegex(DomainError,"锁定"):
+            self.db.add_review(variant_a,"reject","太迟了",self.reviewer)
 
 if __name__=="__main__": unittest.main()

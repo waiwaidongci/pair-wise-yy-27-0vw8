@@ -138,6 +138,17 @@ class CollationDB:
               author_id INTEGER NOT NULL REFERENCES users(id),
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS reviews (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
+              layer INTEGER NOT NULL,
+              decision TEXT NOT NULL CHECK(decision IN ('adopt','reject')),
+              comment TEXT NOT NULL,
+              reviewer_id INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              superseded INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(variant_id,layer)
+            );
             CREATE TABLE IF NOT EXISTS passage_locks (
               passage_id INTEGER PRIMARY KEY REFERENCES passages(id) ON DELETE CASCADE,
               locked_by INTEGER NOT NULL REFERENCES users(id),
@@ -153,15 +164,18 @@ class CollationDB:
             return
         owner = self.add_user("项目负责人", "owner")
         editor = self.add_user("校勘编辑", "editor")
+        reviewer = self.add_user("审阅专家", "reviewer")
         work = self.create_work("一则残卷", "演示不同版本的校勘", owner)
         w1 = self.add_witness(work, "甲本", "version", "馆藏胶片", "")
         w2 = self.add_witness(work, "乙本", "fragment", "残片转录", "第二句残损")
         self.grant_witness_editor(w2, editor, owner)
+        self.grant_work_access(work, reviewer, "review", owner)
         passage = self.add_passage(work, "第1节", "春水东流，故人南去。", owner)
         self.align_passage(passage, w1, "春水东流，故人南去。", 1, owner)
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
         variant = self.create_variant(passage, w2, "春水东流，故人南去。", "综合语义与行款补足", owner, 0)
         self.add_note(variant, "补字仍需参照纸背墨迹。", editor)
+        self.add_review(variant, "adopt", "补字与残存笔画相符，可以采用。", reviewer)
 
     def add_user(self, name: str, role: str) -> int:
         if not name.strip() or role not in {"owner", "editor", "reviewer"}:
@@ -209,6 +223,13 @@ class CollationDB:
             "UNION ALL SELECT 1 FROM witnesses w JOIN witness_editors e ON e.witness_id=w.id "
             "WHERE w.work_id=? AND e.user_id=? LIMIT 1",
             (work_id, user_id, work_id, user_id, work_id, user_id),
+        ).fetchone())
+
+    def can_review_work(self, work_id: int, user_id: int) -> bool:
+        return bool(self.conn.execute(
+            "SELECT 1 FROM works WHERE id=? AND owner_id=? "
+            "UNION ALL SELECT 1 FROM work_access WHERE work_id=? AND user_id=? AND permission='review' LIMIT 1",
+            (work_id, user_id, work_id, user_id),
         ).fetchone())
 
     def can_edit_witness(self, witness_id: int, user_id: int) -> bool:
@@ -319,6 +340,7 @@ class CollationDB:
                 "UPDATE variants SET proposed_text=?,reason=?,layer=?,updated_at=? WHERE id=?",
                 (text, reason.strip(), layer, datetime.now().isoformat(), variant_id),
             )
+            self.conn.execute("UPDATE reviews SET superseded=1 WHERE variant_id=? AND superseded=0", (variant_id,))
             revision = self._record_revision(variant["passage_id"], variant_id, layer, user_id)
             self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?", (revision, user_id, datetime.now().isoformat(), variant["passage_id"]))
         return revision
@@ -367,11 +389,46 @@ class CollationDB:
             )
         return int(cur.lastrowid)
 
+    def add_review(self, variant_id: int, decision: str, comment: str, user_id: int) -> dict:
+        if decision not in {"adopt", "reject"}:
+            raise DomainError("结论必须为 adopt（采用）或 reject（驳回）")
+        if not comment.strip():
+            raise DomainError("审阅意见不能为空")
+        variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+        if not variant:
+            raise DomainError("异文记录不存在")
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (variant["passage_id"],)).fetchone()
+        if passage["status"] == "locked" or self.conn.execute("SELECT 1 FROM passage_locks WHERE passage_id=?", (passage["id"],)).fetchone():
+            raise DomainError("段落已锁定，不能审阅")
+        if not self.can_review_work(passage["work_id"], user_id):
+            raise DomainError("无权审阅该异文")
+        with self.transaction():
+            self.conn.execute(
+                "INSERT INTO reviews(variant_id,layer,decision,comment,reviewer_id,created_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(variant_id,layer) DO UPDATE SET decision=excluded.decision,comment=excluded.comment,"
+                "reviewer_id=excluded.reviewer_id,created_at=excluded.created_at,superseded=0",
+                (variant_id, variant["layer"], decision, comment.strip(), user_id, datetime.now().isoformat()),
+            )
+            row = self.conn.execute(
+                "SELECT id,layer FROM reviews WHERE variant_id=? AND layer=?", (variant_id, variant["layer"])
+            ).fetchone()
+        return {"id": int(row["id"]), "layer": int(row["layer"])}
+
+    def _pending_review_count(self, passage_id: int) -> int:
+        return int(self.conn.execute(
+            "SELECT COUNT(*) FROM variants v WHERE v.passage_id=? AND NOT EXISTS("
+            "SELECT 1 FROM reviews r WHERE r.variant_id=v.id AND r.layer=v.layer AND r.superseded=0)",
+            (passage_id,),
+        ).fetchone()[0])
+
     def lock_passage(self, passage_id: int, user_id: int, reason: str = "") -> None:
         passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
         if not passage:
             raise DomainError("段落不存在")
         self._require_owner(passage["work_id"], user_id)
+        pending = self._pending_review_count(passage_id)
+        if pending:
+            raise DomainError(f"还有 {pending} 条异文未决，不能锁稿")
         with self.transaction():
             self.conn.execute("UPDATE passages SET status='locked',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
             self.conn.execute(
@@ -395,6 +452,7 @@ class CollationDB:
         witnesses = [dict(r) for r in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
         passages = []
         gaps = 0
+        review_summary = {"adopted": 0, "rejected": 0, "pending": 0}
         for passage in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
             alignments = []
             for row in self.conn.execute(
@@ -410,9 +468,21 @@ class CollationDB:
             for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
+                review = self.conn.execute(
+                    "SELECT r.*,u.name AS reviewer_name FROM reviews r JOIN users u ON u.id=r.reviewer_id "
+                    "WHERE r.variant_id=? AND r.layer=? AND r.superseded=0",
+                    (row["id"], row["layer"]),
+                ).fetchone()
+                variant["review_status"] = "pending" if not review else ("adopted" if review["decision"] == "adopt" else "rejected")
+                variant["review"] = dict(review) if review else None
+                variant["review_history"] = [dict(r) for r in self.conn.execute(
+                    "SELECT r.*,u.name AS reviewer_name FROM reviews r JOIN users u ON u.id=r.reviewer_id "
+                    "WHERE r.variant_id=? ORDER BY r.id", (row["id"],),
+                )]
+                review_summary[variant["review_status"]] += 1
                 variants.append(variant)
             passages.append({**dict(passage), "alignments": alignments, "variants": variants})
-        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
+        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps, "review_summary": review_summary}
 
     def snapshot(self) -> dict:
         return {
